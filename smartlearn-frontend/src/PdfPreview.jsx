@@ -12,7 +12,7 @@ function PdfPreview({ upload, activePage, previewKey }) {
     <section className="pdf-preview">
       <header className="pdf-preview-header">
         <span>{upload.filename}</span>
-        <span>Page {activePage}</span>
+        <span className="pdf-page-badge">Page {activePage}</span>
       </header>
       <iframe
         key={`${previewKey}-${activePage}`}
