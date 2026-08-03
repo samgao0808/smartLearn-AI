@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import re
@@ -24,6 +25,18 @@ def extract_pages_for_rag(pdf_path, page_limit: int | None = None) -> list[dict]
     for page_number, page in enumerate(reader.pages, start=1):
         if page_limit is not None and page_number > page_limit:
             break
+        raw_text = page.extract_text() or ""
+        cleaned = clean_text(raw_text)
+        if cleaned:
+            records.append({"page": page_number, "text": cleaned})
+    return records
+
+
+def extract_pages_from_bytes_for_rag(pdf_bytes: bytes) -> list[dict]:
+    """Read page records from raw uploaded PDF bytes."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    records = []
+    for page_number, page in enumerate(reader.pages, start=1):
         raw_text = page.extract_text() or ""
         cleaned = clean_text(raw_text)
         if cleaned:
@@ -462,6 +475,69 @@ def prepare_rag_document(
     }
 
 
+def prepare_rag_chat_record(
+    chat_id: str,
+    filename: str,
+    pdf_bytes: bytes | None = None,
+    pages: list[dict] | None = None,
+    upload_root=None,
+    chunk_mode: str = "character_overlap",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 32,
+    artifact_root=None,
+) -> dict:
+    """Build one upload-time Day 3 record for documents[chat_id]."""
+    if pages is None:
+        if pdf_bytes is None:
+            raise ValueError("Either pdf_bytes or pages must be provided")
+        pages = extract_pages_from_bytes_for_rag(pdf_bytes)
+
+    document = prepare_rag_document(
+        document_id=chat_id,
+        filename=filename,
+        pages=pages,
+        chunk_mode=chunk_mode,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        model_name=model_name,
+        batch_size=batch_size,
+        artifact_root=artifact_root,
+    )
+
+    saved_pdf_path = None
+    if upload_root is not None and pdf_bytes is not None:
+        upload_root = Path(upload_root)
+        upload_root.mkdir(parents=True, exist_ok=True)
+        saved_pdf_path = upload_root / f"{chat_id}.pdf"
+        with open(saved_pdf_path, "wb") as fh:
+            fh.write(pdf_bytes)
+
+    file_path = str(saved_pdf_path) if saved_pdf_path is not None else filename
+    document["chat_id"] = chat_id
+    document["file_path"] = file_path
+    document["saved_pdf_path"] = file_path
+    document["rag"] = {
+        "document_id": chat_id,
+        "index_path": str(document["artifacts"]["index"]),
+        "model_name": model_name,
+    }
+    return document
+
+
+def build_upload_response(document: dict) -> dict:
+    """Return the visible Day 2 upload JSON from a richer Day 3 record."""
+    pages = document.get("pages", [])
+    characters = sum(len(p["text"]) for p in pages)
+    return {
+        "status": "ok",
+        "filename": document.get("filename", "document.pdf"),
+        "pages": len(pages),
+        "characters": characters,
+    }
+
+
 def extract_citations(answer: str, hits: list[dict] | None = None) -> list[int]:
     """Return numeric PDF page citations from an answer or its hits."""
     numbers = [int(n) for n in re.findall(r"\d+", answer)]
@@ -489,7 +565,7 @@ def answer_document(
     question: str,
     top_k: int = 3,
     candidate_pool: int = 60,
-    answer_model: str = "openrouter/free",
+    answer_model: str = "poolside/laguna-s-2.1:free",
 ) -> dict:
     """Retrieve evidence and answer with the LLM when a key exists, else local."""
     hits = search_document(
@@ -521,9 +597,73 @@ def answer_document(
 def append_history(document: dict, question: str, result: dict) -> list[dict]:
     """Append one Q&A turn to the stored document's in-memory history."""
     history = document.get("history", [])
-    history.append({"question": question, "answer": result["answer"]})
+    history.append(
+        {
+            "question": question,
+            "answer": result.get("answer", ""),
+            "citations": result.get("citations", []),
+        }
+    )
     document["history"] = history
     return history
+
+
+def build_grounded_user_prompt(
+    question: str,
+    hits: list[dict],
+    history: list[dict] | None = None,
+) -> str:
+    """Build one grounded prompt from recent history and retrieved evidence."""
+    blocks = []
+    if history:
+        blocks.append("Conversation so far:")
+        for turn in history[-3:]:
+            blocks.append(f'User: {turn.get("question", "")}')
+            blocks.append(f'Assistant: {turn.get("answer", "")}')
+        blocks.append("")
+    blocks.append("Relevant document excerpts:")
+    for i, hit in enumerate(hits, start=1):
+        blocks.append(f"[{i}] (Page {hit['page']}) {hit['text'][:500]}")
+    blocks.append("")
+    blocks.append(f"Question: {question}")
+    blocks.append("Answer concisely from the excerpts above. Cite facts with [Page N].")
+    return "\n".join(blocks)
+
+
+def answer_document_turn(
+    document: dict,
+    question: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "poolside/laguna-s-2.1:free",
+) -> dict:
+    """Answer one question and append the completed turn to in-memory history."""
+    result = answer_document(
+        document,
+        question,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        answer_model=answer_model,
+    )
+    result["history"] = append_history(document, question, result)
+    return result
+
+
+def answer_chat_turn(
+    document: dict,
+    message: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "poolside/laguna-s-2.1:free",
+) -> dict:
+    """Route entry point: fresh retrieval + answer + in-memory history update."""
+    return answer_document_turn(
+        document,
+        message,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        answer_model=answer_model,
+    )
 
 
 def normalize_for_match(text: str) -> str:

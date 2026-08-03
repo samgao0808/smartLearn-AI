@@ -1,15 +1,18 @@
 import { useState } from "react";
-import { askQuestion, uploadPDF } from "./api.js";
+import { uploadPDF } from "./api.js";
+import ChatPanel from "./ChatPanel.jsx";
+import PdfPreview from "./PdfPreview.jsx";
 
 function App() {
   const [file, setFile] = useState(null);
   const [upload, setUpload] = useState(null);
-  const [message, setMessage] = useState("");
-  const [answer, setAnswer] = useState(null);
+  const [uploadKey, setUploadKey] = useState(0);
+  const [activePage, setActivePage] = useState(1);
   const [status, setStatus] = useState("idle");
+  const [chatBusy, setChatBusy] = useState(false);
   const [error, setError] = useState("");
 
-  const busy = status !== "idle";
+  const busy = status !== "idle" || chatBusy;
 
   async function handleUpload(event) {
     event.preventDefault();
@@ -19,6 +22,8 @@ function App() {
       setError("");
       const result = await uploadPDF(file);
       setUpload(result);
+      setActivePage(1);
+      setUploadKey((key) => key + 1); // remount ChatPanel so old messages clear
     } catch (err) {
       setError(err.message || "Upload failed.");
     } finally {
@@ -26,27 +31,15 @@ function App() {
     }
   }
 
-  async function handleAsk(event) {
-    event.preventDefault();
-    if (!message.trim()) return;
-    try {
-      setStatus("asking");
-      setError("");
-      const result = await askQuestion(message.trim());
-      setAnswer(result);
-    } catch (err) {
-      setError(err.message || "Chat failed.");
-    } finally {
-      setStatus("idle");
-    }
+  function handleJumpToPage(page) {
+    setActivePage(page);
   }
 
   return (
     <main>
       <h1>SmartLearn Lite</h1>
 
-      {/* ── Upload section ── */}
-      <form onSubmit={handleUpload}>
+      <form onSubmit={handleUpload} className="upload-form">
         <label htmlFor="pdf-file">PDF file</label>
         <input
           id="pdf-file"
@@ -59,43 +52,25 @@ function App() {
         </button>
       </form>
 
-      {upload && (
-        <p>
-          Uploaded: {upload.filename} ({upload.pages} pages, {upload.characters}{" "}
-          characters)
-        </p>
-      )}
+      {error && <p className="app-error" role="alert">{error}</p>}
 
-      {/* ── Chat section ── */}
-      {upload && (
-        <form onSubmit={handleAsk}>
-          <label htmlFor="message">Message</label>
-          <textarea
-            id="message"
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
+      {upload ? (
+        <div className="workspace">
+          <PdfPreview
+            upload={upload}
+            activePage={activePage}
+            previewKey={uploadKey}
           />
-          <button
-            type="submit"
-            disabled={!message.trim() || busy}
-          >
-            {status === "asking" ? "Asking…" : "Ask"}
-          </button>
-        </form>
-      )}
-
-      {/* ── Shared feedback ── */}
-      {error && <p role="alert">{error}</p>}
-
-      {answer && (
-        <section>
-          <p>{answer.answer}</p>
-          <div>
-            {answer.citations.map((page) => (
-              <span key={page}>Page {page}</span>
-            ))}
-          </div>
-        </section>
+          <ChatPanel
+            key={uploadKey}
+            enabled={!!upload}
+            onBusy={setChatBusy}
+            disabled={busy}
+            onJumpToPage={handleJumpToPage}
+          />
+        </div>
+      ) : (
+        <p className="app-empty">Upload a PDF to start.</p>
       )}
     </main>
   );

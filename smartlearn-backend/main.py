@@ -1,12 +1,17 @@
 import os
-import re
+import sys
+from pathlib import Path
+
+# Allow `uvicorn smartlearn-backend.main:app --reload` from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from pypdf.errors import PdfReadError
 
-from services.llm import answer_from_pages
-from services.pdf import extract_pages
+from services import rag
 
 app = FastAPI(title="SmartLearn Lite API")
 
@@ -27,7 +32,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-documents: dict[str, list[dict]] = {}
+BACKEND_DIR = Path(__file__).resolve().parent
+ARTIFACT_ROOT = BACKEND_DIR / "artifacts" / "rag"
+UPLOAD_ROOT = BACKEND_DIR / "uploads"
+
+documents: dict[str, dict] = {}
 
 
 class ChatRequest(BaseModel):
@@ -58,30 +67,57 @@ async def upload(chat_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="File is empty")
 
     try:
-        pages = extract_pages(pdf_bytes)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        record = rag.prepare_rag_chat_record(
+            chat_id=chat_id,
+            filename=file.filename,
+            pdf_bytes=pdf_bytes,
+            upload_root=UPLOAD_ROOT,
+            artifact_root=ARTIFACT_ROOT,
+        )
+    except (ValueError, PdfReadError) as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
 
-    total_chars = sum(len(p["text"]) for p in pages)
-    if total_chars == 0:
+    if not record["pages"]:
         raise HTTPException(
             status_code=422,
             detail="No extractable text found. OCR is not supported for scanned PDFs.",
         )
 
-    documents[chat_id] = pages
-    return {
-        "status": "ok",
-        "filename": file.filename,
-        "pages": len(pages),
-        "characters": total_chars,
-    }
+    # Store the richer Day 3 record only after it was built successfully,
+    # so an error never leaves a half-written documents[chat_id] entry.
+    documents[chat_id] = record
+    return rag.build_upload_response(record)
+
+
+@app.get("/documents/{chat_id}/file")
+def document_file(chat_id: str):
+    record = documents.get(chat_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No document found for chat_id='{chat_id}'. "
+                    "Upload a PDF via POST /upload first.",
+        )
+
+    file_path = record.get("saved_pdf_path") or record.get("file_path")
+    if not file_path or not Path(file_path).exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No uploaded file found for chat_id='{chat_id}'.",
+        )
+
+    return FileResponse(
+        str(file_path),
+        media_type="application/pdf",
+        filename=record.get("filename"),
+        content_disposition_type="inline",
+    )
 
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    pages = documents.get(request.chat_id)
-    if pages is None:
+    document = documents.get(request.chat_id)
+    if document is None:
         raise HTTPException(
             status_code=404,
             detail=f"No document found for chat_id='{request.chat_id}'. "
@@ -89,19 +125,12 @@ def chat(request: ChatRequest):
         )
 
     try:
-        answer = answer_from_pages(pages, request.message)
-    except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        result = rag.answer_chat_turn(document, request.message)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM service error: {e}")
 
-    valid_page_numbers = {p["page"] for p in pages}
-    raw_citations: list[str] = []
-    for match in re.finditer(r"\[Page\s*([^\]]+)\]", answer):
-        raw_citations.extend(re.findall(r"\d+", match.group(1)))
-    citations = sorted(set(
-        int(n) for n in raw_citations
-        if int(n) in valid_page_numbers
-    ))
-
-    return {"answer": answer, "citations": citations}
+    return {
+        "answer": result["answer"],
+        "citations": result["citations"],
+        "sources": result["sources"],
+    }

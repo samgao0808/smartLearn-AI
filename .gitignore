@@ -1,5 +1,8 @@
 .env
 venv/
+.venv/
 __pycache__/
 *.pyc
 test_files/
+smartlearn-backend/artifacts/
+smartlearn-backend/uploads/
