@@ -1,7 +1,9 @@
 import json
+import os
 import re
 from pathlib import Path
 
+import faiss
 from pypdf import PdfReader
 
 
@@ -15,11 +17,13 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def extract_pages_for_rag(pdf_path) -> list[dict]:
+def extract_pages_for_rag(pdf_path, page_limit: int | None = None) -> list[dict]:
     """Read a PDF page by page, preserving original page numbers."""
     reader = PdfReader(str(pdf_path))
     records = []
     for page_number, page in enumerate(reader.pages, start=1):
+        if page_limit is not None and page_number > page_limit:
+            break
         raw_text = page.extract_text() or ""
         cleaned = clean_text(raw_text)
         if cleaned:
@@ -305,3 +309,384 @@ def ensure_artifacts(
     save_json(manifest, paths["manifest_path"])
 
     return {"chunks": chunks, "embeddings": embeddings, "manifest": manifest}
+
+
+def relative_path_str(path, base) -> str:
+    """Return a shorter display path for one artifact relative to a base folder."""
+    return os.path.relpath(str(path), str(base))
+
+
+def build_faiss_index(embeddings) -> "faiss.Index":
+    """Build a searchable FAISS inner-product index from normalized vectors."""
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    return index
+
+
+def save_faiss_index(index, index_path) -> None:
+    """Write a FAISS index to a binary .faiss file."""
+    index_path = Path(index_path)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(index_path))
+
+
+def load_faiss_index(index_path) -> "faiss.Index":
+    """Load a saved FAISS index back into memory."""
+    return faiss.read_index(str(index_path))
+
+
+def ensure_index(
+    document_id: str,
+    pdf_name: str,
+    pages: list[dict] | None = None,
+    pdf_path=None,
+    chunk_mode: str = "character_overlap",
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    batch_size: int = 32,
+    artifact_root=None,
+) -> dict:
+    """Build or load a reusable FAISS index bundle for one PDF."""
+    if artifact_root is None:
+        raise ValueError("artifact_root is required to persist RAG artifacts")
+
+    if pages is None:
+        if pdf_path is None:
+            raise ValueError("Either pages or pdf_path must be provided")
+        pages = extract_pages_for_rag(pdf_path)
+
+    bundle = ensure_artifacts(
+        document_id=document_id,
+        pdf_name=pdf_name,
+        pages=pages,
+        chunk_mode=chunk_mode,
+        model_name=model_name,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        batch_size=batch_size,
+        artifact_root=artifact_root,
+    )
+
+    tag = model_tag(model_name)
+    index_dir = (
+        Path(artifact_root)
+        / document_id
+        / f"{chunk_mode}_c{chunk_size}_o{overlap}_{tag}"
+    )
+    index_path = index_dir / "index.faiss"
+    meta_path = index_dir / "index.meta.json"
+
+    signature = {
+        "document_id": document_id,
+        "pdf_name": pdf_name,
+        "num_chunks": len(bundle["chunks"]),
+        "embedding_dim": bundle["embeddings"].shape[1],
+        "chunk_mode": chunk_mode,
+        "chunk_size": chunk_size,
+        "overlap": overlap,
+        "model_name": model_name,
+    }
+
+    if index_path.exists() and meta_path.exists():
+        meta = load_json(meta_path)
+        if all(meta.get(k) == v for k, v in signature.items()):
+            return {
+                "chunks": bundle["chunks"],
+                "embeddings": bundle["embeddings"],
+                "manifest": bundle["manifest"],
+                "index": load_faiss_index(index_path),
+                "paths": {
+                    "index": index_path,
+                    "chunks": Path(bundle["manifest"]["chunk_path"]),
+                    "embeddings": Path(bundle["manifest"]["embedding_path"]),
+                },
+            }
+
+    index = build_faiss_index(bundle["embeddings"])
+    save_faiss_index(index, index_path)
+    save_json(signature, meta_path)
+
+    return {
+        "chunks": bundle["chunks"],
+        "embeddings": bundle["embeddings"],
+        "manifest": bundle["manifest"],
+        "index": index,
+        "paths": {
+            "index": index_path,
+            "chunks": Path(bundle["manifest"]["chunk_path"]),
+            "embeddings": Path(bundle["manifest"]["embedding_path"]),
+        },
+    }
+
+
+def prepare_rag_document(
+    document_id: str,
+    filename: str,
+    pages: list[dict],
+    chunk_mode: str = "character_overlap",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 32,
+    artifact_root=None,
+) -> dict:
+    """Return a server-style document record with pages, chunks, and index paths."""
+    bundle = ensure_index(
+        document_id=document_id,
+        pdf_name=filename,
+        pages=pages,
+        chunk_mode=chunk_mode,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        model_name=model_name,
+        batch_size=batch_size,
+        artifact_root=artifact_root,
+    )
+    return {
+        "document_id": document_id,
+        "filename": filename,
+        "pages": pages,
+        "chunks": bundle["chunks"],
+        "chunk_size": len(bundle["chunks"]),
+        "num_chunks": len(bundle["chunks"]),
+        "embedding_dim": bundle["embeddings"].shape[1],
+        "model_name": model_name,
+        "model_source": resolve_model_source(model_name, artifact_root),
+        "history": [],
+        "artifacts": {
+            "index": bundle["paths"]["index"],
+            "chunks": bundle["paths"]["chunks"],
+            "embeddings": bundle["paths"]["embeddings"],
+        },
+    }
+
+
+def extract_citations(answer: str, hits: list[dict] | None = None) -> list[int]:
+    """Return numeric PDF page citations from an answer or its hits."""
+    numbers = [int(n) for n in re.findall(r"\d+", answer)]
+    if hits:
+        valid_pages = {int(h["page"]) for h in hits}
+        numbers = [n for n in numbers if n in valid_pages]
+    return sorted(set(numbers))
+
+
+def build_sources(hits: list[dict]) -> list[dict]:
+    """Return frontend-friendly source objects with page, chunk id, score, and preview."""
+    return [
+        {
+            "page": int(h["page"]),
+            "chunk_id": h["chunk_id"],
+            "score": round(float(h["score"]), 4),
+            "preview": h["text"][:200],
+        }
+        for h in hits
+    ]
+
+
+def answer_document(
+    document: dict,
+    question: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "openrouter/free",
+) -> dict:
+    """Retrieve evidence and answer with the LLM when a key exists, else local."""
+    hits = search_document(
+        question,
+        document,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+    )
+
+    answer = None
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if api_key:
+        try:
+            from services.llm import answer_from_pages
+
+            evidence_pages = [{"page": h["page"], "text": h["text"]} for h in hits]
+            answer = answer_from_pages(evidence_pages, question)
+        except Exception:
+            answer = None
+
+    if answer is None:
+        answer = best_sentence_answer(question, hits)
+
+    citations = extract_citations(answer, hits)
+    sources = build_sources(hits)
+    return {"answer": answer, "citations": citations, "sources": sources}
+
+
+def append_history(document: dict, question: str, result: dict) -> list[dict]:
+    """Append one Q&A turn to the stored document's in-memory history."""
+    history = document.get("history", [])
+    history.append({"question": question, "answer": result["answer"]})
+    document["history"] = history
+    return history
+
+
+def normalize_for_match(text: str) -> str:
+    """Normalize text for simple string-based scoring."""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def contains_any_answer(text: str, answers: list[str]) -> bool:
+    """Return whether any acceptable answer appears after normalization."""
+    normalized = normalize_for_match(text)
+    return any(normalize_for_match(answer) in normalized for answer in answers)
+
+
+def evaluate_questions(
+    eval_set: list[dict],
+    documents_by_name: dict[str, dict],
+    top_k: int = 3,
+    candidate_pool: int = 60,
+):
+    """Answer each question and summarize retrieval / answer hit per row."""
+    import pandas as pd
+
+    rows = []
+    for item in eval_set:
+        pdf_name = item["pdf_name"]
+        question = item["question"]
+        answers = item["answers"]
+        document = documents_by_name[pdf_name]
+
+        hits = search_document(
+            question,
+            document,
+            top_k=top_k,
+            candidate_pool=candidate_pool,
+        )
+        pages = sorted({int(h["page"]) for h in hits})
+        local_answer = best_sentence_answer(question, hits)
+
+        page_text = " ".join(h["text"] for h in hits)
+        retrieval_hit = contains_any_answer(page_text, answers)
+        answer_hit = contains_any_answer(local_answer, answers)
+
+        rows.append(
+            {
+                "pdf_name": pdf_name,
+                "question": question,
+                "pages": pages,
+                "local_answer": local_answer,
+                "retrieval_hit": retrieval_hit,
+                "answer_hit": answer_hit,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "for",
+    "with", "at", "by", "is", "are", "was", "were", "be", "been", "being",
+    "this", "that", "these", "those", "which", "what", "how", "why", "who",
+    "do", "does", "did", "it", "its", "as", "from", "we", "you", "they",
+}
+
+
+def keyword_set(text: str) -> set:
+    """Extract lightweight lexical tokens (stopwords removed) for reranking."""
+    tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
+    return tokens - _STOPWORDS
+
+
+def search_bundle(
+    question: str,
+    bundle: dict,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    batch_size: int = 1,
+    history: list[dict] | None = None,
+) -> list[dict]:
+    """Retrieve top-k hits from an in-memory index bundle."""
+    import numpy as np
+
+    model_source = bundle.get("model_source") or bundle["manifest"]["model_name"]
+    model = load_model(model_source)
+    query = embed_texts(
+        model,
+        [question],
+        batch_size=batch_size,
+    )
+    scores, ids = bundle["index"].search(query, candidate_pool)
+    flat_ids = ids[0]
+    flat_scores = scores[0]
+    chunks = bundle["chunks"]
+    hits = []
+    for idx, score in zip(flat_ids, flat_scores):
+        if idx < 0 or idx >= len(chunks):
+            continue
+        chunk = chunks[idx]
+        hits.append(
+            {
+                "chunk_id": chunk["chunk_id"],
+                "page": chunk["page"],
+                "text": chunk["text"],
+                "score": float(score),
+            }
+        )
+        if len(hits) >= top_k:
+            break
+    return hits
+
+
+def search_document(
+    question: str,
+    document: dict,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    history: list[dict] | None = None,
+) -> list[dict]:
+    """Load the saved FAISS index and retrieve top-k hits."""
+    bundle = {
+        "chunks": document["chunks"],
+        "manifest": {
+            "model_name": document["model_name"],
+        },
+        "model_source": document.get("model_source") or document["model_name"],
+        "index": load_faiss_index(document["artifacts"]["index"]),
+    }
+    return search_bundle(
+        question,
+        bundle,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        history=history,
+    )
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split retrieved chunk text into candidate answer sentences."""
+    pieces = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [p.strip() for p in pieces if p.strip()]
+
+
+def best_sentence_answer(question: str, hits: list[dict]) -> str:
+    """Return one short local answer sentence with a page tag when possible."""
+    if not hits:
+        return "No relevant information found in the document."
+
+    q_tokens = keyword_set(question)
+    best_sentence = ""
+    best_page = None
+    best_key = (-1, -1.0)  # (token overlap, hit score): overlap first, then rank
+    for hit in hits:
+        hit_score = float(hit.get("score", 0.0))
+        for sentence in split_sentences(hit["text"]):
+            s_tokens = keyword_set(sentence)
+            if not s_tokens:
+                continue
+            overlap = len(q_tokens & s_tokens)
+            key = (overlap, hit_score)
+            if key > best_key:
+                best_key = key
+                best_sentence = sentence
+                best_page = hit["page"]
+    if best_sentence:
+        if best_page is not None:
+            return f"{best_sentence} [Page {best_page}]"
+        return best_sentence
+    return hits[0]["text"][:200] + f" [Page {hits[0]['page']}]"
