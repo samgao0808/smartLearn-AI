@@ -566,14 +566,16 @@ def answer_document(
     top_k: int = 3,
     candidate_pool: int = 60,
     answer_model: str = "poolside/laguna-s-2.1:free",
+    hits: list[dict] | None = None,
 ) -> dict:
     """Retrieve evidence and answer with the LLM when a key exists, else local."""
-    hits = search_document(
-        question,
-        document,
-        top_k=top_k,
-        candidate_pool=candidate_pool,
-    )
+    if hits is None:
+        hits = search_document(
+            question,
+            document,
+            top_k=top_k,
+            candidate_pool=candidate_pool,
+        )
 
     answer = None
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -637,14 +639,27 @@ def answer_document_turn(
     candidate_pool: int = 60,
     answer_model: str = "poolside/laguna-s-2.1:free",
 ) -> dict:
-    """Answer one question and append the completed turn to in-memory history."""
+    """Answer one question and append the completed turn to in-memory history.
+
+    Retrieval-on-demand (C2): a short follow-up reuses the previous turn's
+    hits instead of running a fresh FAISS search.
+    """
+    hits, reused = retrieve_or_reuse(
+        question,
+        document,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+    )
+    document["last_hits"] = hits
     result = answer_document(
         document,
         question,
         top_k=top_k,
         candidate_pool=candidate_pool,
         answer_model=answer_model,
+        hits=hits,
     )
+    result["reused"] = reused
     result["history"] = append_history(document, question, result)
     return result
 
@@ -675,7 +690,7 @@ def answer_document_stream(
     """Generator yielding SSE-friendly event dicts for a streamed answer.
 
     Event shapes:
-        {"type": "meta", "citations": [...], "sources": [...]}
+        {"type": "meta", "citations": [...], "sources": [...], "reused": bool}
         {"type": "delta", "text": "..."}
         {"type": "done"}
 
@@ -683,15 +698,21 @@ def answer_document_stream(
     answer text) so the UI can render source buttons before the first token.
     Falls back to the local sentence answer if the LLM stream fails.
     """
-    hits = search_document(
+    hits, reused = retrieve_or_reuse(
         message,
         document,
         top_k=top_k,
         candidate_pool=candidate_pool,
     )
+    document["last_hits"] = hits
     citations = sorted({int(h["page"]) for h in hits})
     sources = build_sources(hits)
-    yield {"type": "meta", "citations": citations, "sources": sources}
+    yield {
+        "type": "meta",
+        "citations": citations,
+        "sources": sources,
+        "reused": reused,
+    }
 
     full_answer = ""
     try:
@@ -779,6 +800,85 @@ def keyword_set(text: str) -> set:
     """Extract lightweight lexical tokens (stopwords removed) for reranking."""
     tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
     return tokens - _STOPWORDS
+
+
+_FOLLOWUP_WORDS = {
+    # English — unambiguous deictic/content cues ("more", "it", "second" ...)
+    "more", "details", "detail", "elaborate", "explain", "continue",
+    "second", "third", "next", "mentioned", "above", "previous", "earlier",
+    "it", "this", "that", "they", "these", "those",
+    # Chinese
+    "继续", "更多", "详细", "细节", "第二个", "上面", "刚才", "前面", "然后", "再",
+    "它", "这个", "这些", "那些", "那个",
+}
+
+# Interrogatives/connectors that only mean "follow-up" when the message
+# carries NO content words at all ("why?", "and then?").
+_BARE_FOLLOWUPS = {
+    "why", "what", "which", "how", "who", "where", "when", "so", "then",
+    "and", "or", "but",
+    "为什么", "怎么",
+}
+
+# Everything that can signal a reference to prior context.
+_REFERENCE_WORDS = (
+    _FOLLOWUP_WORDS
+    | _BARE_FOLLOWUPS
+    | {"and", "or", "but", "so", "then", "too", "also"}
+)
+
+
+def should_reuse_last_hits(message: str, document: dict) -> bool:
+    """Decide whether a follow-up can skip fresh retrieval (C2).
+
+    True when there is prior history, the previous hits are still around,
+    and the new message either contains an unambiguous deictic cue
+    ("more details", "it", "second" ...) or carries no new content words
+    at all ("why?", "and then?").
+    """
+    history = document.get("history") or []
+    if not history:
+        return False
+    last_hits = document.get("last_hits")
+    if not last_hits:
+        return False
+    text = message.lower()
+    ascii_words = set(re.findall(r"[a-z0-9]+", text))
+    q_tokens = ascii_words - _STOPWORDS
+    cn_deictic = [word for word in _FOLLOWUP_WORDS if not word.isascii()]
+    cn_reference = [word for word in _REFERENCE_WORDS if not word.isascii()]
+    has_cn_deictic = any(word in text for word in cn_deictic)
+    if q_tokens:
+        # Message has content words: reuse when every content word is itself
+        # a reference word ("and then?"), or any deictic cue is present
+        # ("give me more details").
+        if all(token in _REFERENCE_WORDS for token in q_tokens):
+            return True
+        return any(word in _FOLLOWUP_WORDS for word in ascii_words) or has_cn_deictic
+    if ascii_words:
+        # Pure reference like "why?" / "and then?" — every word must be one.
+        return all(word in _REFERENCE_WORDS for word in ascii_words)
+    # Pure Chinese phrase: reuse when any reference word appears anywhere
+    # (covers "为什么？" from _BARE_FOLLOWUPS and "更多细节" from _FOLLOWUP_WORDS).
+    return any(word in text for word in cn_reference)
+
+
+def retrieve_or_reuse(
+    message: str,
+    document: dict,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+) -> tuple[list[dict], bool]:
+    """Retrieve fresh hits, or reuse the last turn's hits for a follow-up."""
+    if should_reuse_last_hits(message, document):
+        return list(document["last_hits"])[:top_k], True
+    hits = search_document(
+        message,
+        document,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+    )
+    return hits, False
 
 
 def rerank_hybrid(
