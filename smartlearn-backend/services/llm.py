@@ -40,3 +40,41 @@ def answer_from_pages(pages: list[dict], message: str) -> str:
         ],
     )
     return response.choices[0].message.content or ""
+
+
+def rewrite_query(message: str, max_tokens: int = 80) -> str:
+    """Paraphrase a vague question into a keyword search query for the retriever.
+
+    Best-effort: returns the original message on any failure so retrieval always
+    has something to embed.
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        return message
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free"),
+            temperature=0.0,
+            max_tokens=max_tokens,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Paraphrase the user question into ONE keyword search query "
+                        "that a PDF text retriever can match. Include the key terms and "
+                        "likely answer keywords. Do NOT invent facts or names. "
+                        "Return only the query sentence, no explanations."
+                    ),
+                },
+                {"role": "user", "content": message},
+            ],
+        )
+        text = (response.choices[0].message.content or "").strip()
+        return text or message
+    except Exception:
+        return message
