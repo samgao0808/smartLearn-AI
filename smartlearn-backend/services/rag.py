@@ -733,6 +733,44 @@ def keyword_set(text: str) -> set:
     return tokens - _STOPWORDS
 
 
+def rerank_hybrid(
+    question: str,
+    candidates: list[dict],
+    top_k: int = 3,
+    dense_weight: float = 0.6,
+) -> list[dict]:
+    """Blend dense scores with lexical keyword overlap, then return top-k.
+
+    Lexical overlap rewards exact content-word matches, which dense embeddings
+    alone can miss for specific terms (e.g. "BM25", "HotpotQA"). The returned
+    hits keep their original dense ``score`` field for ``build_sources``.
+    """
+    if not candidates:
+        return []
+    dense = [c["score"] for c in candidates]
+    d_min, d_max = min(dense), max(dense)
+
+    def norm(value: float) -> float:
+        if d_max - d_min < 1e-9:
+            return 1.0
+        return (value - d_min) / (d_max - d_min)
+
+    q_tokens = keyword_set(question)
+    scored = []
+    for candidate in candidates:
+        c_tokens = keyword_set(candidate["text"])
+        overlap = len(q_tokens & c_tokens)
+        # Require >= 2 content-word matches: a single token (often a stray
+        # conference/journal name on a references page) is pure noise.
+        lexical = overlap / max(1, len(q_tokens)) if overlap >= 2 else 0.0
+        combined = dense_weight * norm(candidate["score"]) + (
+            1 - dense_weight
+        ) * lexical
+        scored.append((combined, candidate))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [candidate for _, candidate in scored[:top_k]]
+
+
 def search_bundle(
     question: str,
     bundle: dict,
@@ -741,7 +779,7 @@ def search_bundle(
     batch_size: int = 1,
     history: list[dict] | None = None,
 ) -> list[dict]:
-    """Retrieve top-k hits from an in-memory index bundle."""
+    """Retrieve a wide candidate pool, then hybrid-rerank down to top-k."""
     import numpy as np
 
     model_source = bundle.get("model_source") or bundle["manifest"]["model_name"]
@@ -755,12 +793,12 @@ def search_bundle(
     flat_ids = ids[0]
     flat_scores = scores[0]
     chunks = bundle["chunks"]
-    hits = []
+    candidates = []
     for idx, score in zip(flat_ids, flat_scores):
         if idx < 0 or idx >= len(chunks):
             continue
         chunk = chunks[idx]
-        hits.append(
+        candidates.append(
             {
                 "chunk_id": chunk["chunk_id"],
                 "page": chunk["page"],
@@ -768,9 +806,9 @@ def search_bundle(
                 "score": float(score),
             }
         )
-        if len(hits) >= top_k:
+        if len(candidates) >= candidate_pool:
             break
-    return hits
+    return rerank_hybrid(question, candidates, top_k=top_k)
 
 
 def search_document(
