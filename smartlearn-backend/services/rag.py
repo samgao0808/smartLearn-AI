@@ -666,6 +666,54 @@ def answer_chat_turn(
     )
 
 
+def answer_document_stream(
+    document: dict,
+    message: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+):
+    """Generator yielding SSE-friendly event dicts for a streamed answer.
+
+    Event shapes:
+        {"type": "meta", "citations": [...], "sources": [...]}
+        {"type": "delta", "text": "..."}
+        {"type": "done"}
+
+    Citations/sources come straight from the hit pages (not parsed from the
+    answer text) so the UI can render source buttons before the first token.
+    Falls back to the local sentence answer if the LLM stream fails.
+    """
+    hits = search_document(
+        message,
+        document,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+    )
+    citations = sorted({int(h["page"]) for h in hits})
+    sources = build_sources(hits)
+    yield {"type": "meta", "citations": citations, "sources": sources}
+
+    full_answer = ""
+    try:
+        from services.llm import stream_answer_from_pages
+
+        evidence_pages = [{"page": h["page"], "text": h["text"]} for h in hits]
+        for delta in stream_answer_from_pages(evidence_pages, message):
+            full_answer += delta
+            yield {"type": "delta", "text": delta}
+    except Exception:
+        fallback = best_sentence_answer(message, hits)
+        full_answer = fallback
+        yield {"type": "delta", "text": fallback}
+
+    append_history(
+        document,
+        message,
+        {"answer": full_answer, "citations": citations},
+    )
+    yield {"type": "done"}
+
+
 def normalize_for_match(text: str) -> str:
     """Normalize text for simple string-based scoring."""
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()

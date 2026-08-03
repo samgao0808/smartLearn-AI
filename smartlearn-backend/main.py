@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from pathlib import Path
@@ -7,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from pypdf.errors import PdfReadError
 
@@ -134,3 +135,32 @@ def chat(request: ChatRequest):
         "citations": result["citations"],
         "sources": result["sources"],
     }
+
+
+@app.post("/chat/stream")
+def chat_stream(request: ChatRequest):
+    document = documents.get(request.chat_id)
+    if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No document found for chat_id='{request.chat_id}'. "
+                    "Upload a PDF via POST /upload first.",
+        )
+
+    def event_stream():
+        try:
+            for event in rag.answer_document_stream(document, request.message):
+                yield f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            payload = json.dumps({"detail": str(e)}, ensure_ascii=False)
+            yield f"event: error\ndata: {payload}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
